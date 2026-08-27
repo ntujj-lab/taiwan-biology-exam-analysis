@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useMemo, useState, type FormEvent } from 'react';
-import { GoogleAuthProvider, onAuthStateChanged, signInWithRedirect, signOut, type User } from 'firebase/auth';
+import { GoogleAuthProvider, onAuthStateChanged, signInWithPopup, signOut, type User } from 'firebase/auth';
 import { collection, deleteDoc, doc, getDocs, serverTimestamp, setDoc, writeBatch } from 'firebase/firestore';
 import { ADMIN_EMAIL, getFirebaseServices } from '../firebase';
 import { questions as seedQuestions, type Question } from '../questions';
@@ -122,7 +122,7 @@ export default function AdminPage() {
       const { auth } = getFirebaseServices();
       const provider = new GoogleAuthProvider();
       provider.setCustomParameters({ prompt: 'select_account' });
-      await signInWithRedirect(auth, provider);
+      await signInWithPopup(auth, provider);
     } catch (signInError) {
       setError(firebaseError(signInError));
     } finally {
