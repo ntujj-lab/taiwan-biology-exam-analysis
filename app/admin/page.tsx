@@ -241,7 +241,7 @@ export default function AdminPage() {
     return (
       <main className="flex min-h-screen items-center justify-center bg-[radial-gradient(circle_at_top_left,#dcefff_0,transparent_32rem),linear-gradient(180deg,#f7fafe,#eaf1f7)] px-5 text-[#132238]">
         <section className="w-full max-w-lg rounded-[2rem] border border-white bg-white/95 p-7 shadow-[0_28px_80px_rgba(23,59,92,.14)] sm:p-10">
-          <a href="../" className="text-sm font-black text-[#0b6bcb]">← 返回學生網站</a>
+          <a href="./" className="text-sm font-black text-[#0b6bcb]">← 返回學生網站</a>
           <div className="mt-8 flex h-14 w-14 items-center justify-center rounded-2xl bg-[#0b6bcb] font-black text-white">DB</div>
           <p className="mt-6 text-xs font-black tracking-[0.16em] text-[#0b6bcb]">CONTENT ADMIN</p>
           <h1 className="mt-2 text-3xl font-black">題庫內容管理後台</h1>
@@ -260,7 +260,7 @@ export default function AdminPage() {
         <div className="mx-auto flex max-w-[1500px] flex-wrap items-center gap-3 px-5 py-4 lg:px-8">
           <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-[#0b6bcb] text-xs font-black text-white">DB</div>
           <div><p className="text-[10px] font-black tracking-[0.14em] text-[#0b6bcb]">CONTENT ADMIN</p><h1 className="font-black">會考生物題庫管理</h1></div>
-          <div className="ml-auto flex items-center gap-2"><a href="../" className="rounded-xl border border-[#cad7e4] px-3 py-2 text-xs font-black text-[#42566c]">查看網站 ↗</a><button type="button" onClick={() => signOut(getFirebaseServices().auth)} className="rounded-xl bg-[#edf2f7] px-3 py-2 text-xs font-black text-[#52677c]">登出</button></div>
+          <div className="ml-auto flex items-center gap-2"><a href="./" className="rounded-xl border border-[#cad7e4] px-3 py-2 text-xs font-black text-[#42566c]">查看網站 ↗</a><button type="button" onClick={() => signOut(getFirebaseServices().auth)} className="rounded-xl bg-[#edf2f7] px-3 py-2 text-xs font-black text-[#52677c]">登出</button></div>
         </div>
       </header>
 
