@@ -1,22 +1,61 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    function isAdmin() {
+    function signedIn() {
       return request.auth != null
         && request.auth.token.email_verified == true
-        && request.auth.token.email == 'ntujj@ms.tyc.edu.tw';
+        && request.auth.token.email is string;
+    }
+
+    function email() {
+      return request.auth.token.email;
+    }
+
+    function isPrimaryAdmin() {
+      return signedIn() && email() == 'ntujj@ms.tyc.edu.tw';
+    }
+
+    function member() {
+      return get(/databases/$(database)/documents/members/$(email())).data;
+    }
+
+    function hasRole(role) {
+      return signedIn()
+        && exists(/databases/$(database)/documents/members/$(email()))
+        && member().active == true
+        && member().role == role;
+    }
+
+    function canReadBackend() {
+      return isPrimaryAdmin()
+        || hasRole('viewer')
+        || hasRole('editor')
+        || hasRole('admin');
+    }
+
+    function canEditContent() {
+      return isPrimaryAdmin() || hasRole('editor') || hasRole('admin');
+    }
+
+    function isAdmin() {
+      return isPrimaryAdmin() || hasRole('admin');
     }
 
     match /questions/{questionId} {
-      allow read: if resource.data.published == true || isAdmin();
-      allow create, update: if isAdmin()
+      allow read: if resource.data.published == true || canReadBackend();
+      allow create, update: if canEditContent()
         && request.resource.data.id == questionId;
       allow delete: if isAdmin();
     }
 
+    match /members/{memberEmail} {
+      allow read: if isAdmin() || (signedIn() && memberEmail == email());
+      allow create, update, delete: if isAdmin();
+    }
+
     match /siteSettings/{documentId} {
       allow read: if true;
-      allow write: if isAdmin();
+      allow write: if canEditContent();
     }
   }
 }
