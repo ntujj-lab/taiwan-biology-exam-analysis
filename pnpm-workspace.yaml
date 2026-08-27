@@ -2,13 +2,17 @@ packages:
   - .
 
 allowBuilds:
+  '@firebase/util': true
   esbuild: true
+  protobufjs: true
   sharp: true
   unrs-resolver: true
   workerd: true
 
 onlyBuiltDependencies:
+  - '@firebase/util'
   - esbuild
+  - protobufjs
   - sharp
   - unrs-resolver
   - workerd
