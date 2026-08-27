@@ -2,13 +2,31 @@
 
 import { useEffect, useMemo, useState, type FormEvent } from 'react';
 import { GoogleAuthProvider, onAuthStateChanged, signInWithPopup, signOut, type User } from 'firebase/auth';
-import { collection, deleteDoc, doc, getDocs, serverTimestamp, setDoc, writeBatch } from 'firebase/firestore';
+import { collection, deleteDoc, doc, getDoc, getDocs, serverTimestamp, setDoc, writeBatch } from 'firebase/firestore';
 import { ADMIN_EMAIL, getFirebaseServices } from '../firebase';
 import { questions as seedQuestions, type Question } from '../questions';
 
 type ManagedQuestion = Question & {
   published: boolean;
 };
+
+type Role = 'viewer' | 'editor' | 'admin';
+
+type Membership = {
+  email: string;
+  name: string;
+  role: Role;
+  active: boolean;
+};
+
+const roleOptions: { value: Role; label: string; description: string }[] = [
+  { value: 'viewer', label: '檢視者', description: '可登入後台並讀取全部題目與草稿。' },
+  { value: 'editor', label: '編輯者', description: '可讀取、新增、修改與發布題目，但不能刪除或管理成員。' },
+  { value: 'admin', label: '管理員', description: '擁有完整題庫與成員權限管理能力。' },
+];
+
+const roleLabel = (role: Role) => roleOptions.find((item) => item.value === role)?.label ?? role;
+const normalizeEmail = (email: string) => email.trim().toLowerCase();
 
 const difficultyOptions: Question['difficulty'][] = ['基礎', '中等', '進階'];
 const answerOptions = ['A', 'B', 'C', 'D'] as const;
@@ -62,6 +80,8 @@ const firebaseError = (error: unknown) => {
   if (message.includes('unauthorized-domain')) return '目前網域尚未獲得 Firebase 登入授權。';
   if (message.includes('permission-denied')) return '這個帳號沒有資料庫管理權限。';
   if (message.includes('popup-closed')) return '登入視窗已關閉，尚未完成登入。';
+  if (message.includes('member-disabled')) return '這個後台帳號目前已停用。';
+  if (message.includes('member-not-authorized')) return '這個 Google 帳號尚未加入後台成員名單。';
   return `操作失敗：${message}`;
 };
 
@@ -75,8 +95,14 @@ export default function AdminPage() {
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState('');
   const [error, setError] = useState('');
+  const [membership, setMembership] = useState<Membership | null>(null);
+  const [members, setMembers] = useState<Membership[]>([]);
+  const [panel, setPanel] = useState<'questions' | 'members'>('questions');
+  const [memberForm, setMemberForm] = useState<Membership>({ email: '', name: '', role: 'viewer', active: true });
+  const [editingMemberEmail, setEditingMemberEmail] = useState<string | null>(null);
 
-  const isAdmin = user?.email === ADMIN_EMAIL;
+  const isAdmin = membership?.role === 'admin';
+  const canEdit = membership?.role === 'editor' || isAdmin;
 
   const loadQuestions = async () => {
     const { db } = getFirebaseServices();
@@ -87,24 +113,53 @@ export default function AdminPage() {
     setRecords(next);
   };
 
+  const loadMembers = async () => {
+    const { db } = getFirebaseServices();
+    const snapshot = await getDocs(collection(db, 'members'));
+    const next = snapshot.docs
+      .map((item) => item.data() as Membership)
+      .filter((item) => normalizeEmail(item.email) !== ADMIN_EMAIL);
+    next.unshift({ email: ADMIN_EMAIL, name: '主要管理員', role: 'admin', active: true });
+    setMembers(next.sort((a, b) => a.role.localeCompare(b.role) || a.email.localeCompare(b.email)));
+  };
+
+  const resolveMembership = async (nextUser: User): Promise<Membership> => {
+    const email = normalizeEmail(nextUser.email ?? '');
+    if (email === ADMIN_EMAIL) {
+      return { email, name: nextUser.displayName ?? '主要管理員', role: 'admin', active: true };
+    }
+    const { db } = getFirebaseServices();
+    const snapshot = await getDoc(doc(db, 'members', email));
+    if (!snapshot.exists()) throw new Error('member-not-authorized');
+    const member = snapshot.data() as Membership;
+    if (!member.active) throw new Error('member-disabled');
+    return { ...member, email };
+  };
+
   useEffect(() => {
     const { auth } = getFirebaseServices();
     return onAuthStateChanged(auth, async (nextUser) => {
-      setAuthReady(true);
       setError('');
-      if (nextUser && nextUser.email !== ADMIN_EMAIL) {
-        await signOut(auth);
+      if (!nextUser) {
         setUser(null);
-        setError(`請使用管理員帳號 ${ADMIN_EMAIL} 登入。`);
+        setMembership(null);
+        setAuthReady(true);
         return;
       }
-      setUser(nextUser);
-      if (nextUser) {
-        try {
-          await loadQuestions();
-        } catch (loadError) {
-          setError(firebaseError(loadError));
-        }
+
+      try {
+        const nextMembership = await resolveMembership(nextUser);
+        setUser(nextUser);
+        setMembership(nextMembership);
+        await loadQuestions();
+        if (nextMembership.role === 'admin') await loadMembers();
+      } catch (loadError) {
+        await signOut(auth);
+        setUser(null);
+        setMembership(null);
+        setError(firebaseError(loadError));
+      } finally {
+        setAuthReady(true);
       }
     });
   }, []);
@@ -131,6 +186,7 @@ export default function AdminPage() {
   };
 
   const beginCreate = () => {
+    if (!canEdit) return;
     setEditingId(null);
     setForm(makeBlankQuestion());
     setNotice('');
@@ -138,6 +194,7 @@ export default function AdminPage() {
   };
 
   const beginEdit = (question: ManagedQuestion) => {
+    if (!canEdit) return;
     setEditingId(question.id);
     setForm({ ...question, options: question.options.map((option) => ({ ...option })) });
     setNotice('');
@@ -145,7 +202,7 @@ export default function AdminPage() {
   };
 
   const importSeedQuestions = async () => {
-    if (!user || !isAdmin) return;
+    if (!user || !canEdit) return;
     const existingIds = new Set(records.map((item) => item.id));
     const missing = seedQuestions.filter((item) => !existingIds.has(item.id));
     if (!missing.length) {
@@ -179,7 +236,7 @@ export default function AdminPage() {
 
   const saveQuestion = async (event: FormEvent) => {
     event.preventDefault();
-    if (!form || !user || !isAdmin) return;
+    if (!form || !user || !canEdit) return;
     if (!/^\d{3}-\d+$/.test(form.id.trim())) {
       setError('題目 ID 請使用「年度-題號」，例如 115-6。');
       return;
@@ -233,6 +290,78 @@ export default function AdminPage() {
     }
   };
 
+  const resetMemberForm = () => {
+    setEditingMemberEmail(null);
+    setMemberForm({ email: '', name: '', role: 'viewer', active: true });
+  };
+
+  const editMember = (member: Membership) => {
+    if (!isAdmin || normalizeEmail(member.email) === ADMIN_EMAIL) return;
+    setEditingMemberEmail(normalizeEmail(member.email));
+    setMemberForm({ ...member, email: normalizeEmail(member.email) });
+    setNotice('');
+    setError('');
+  };
+
+  const saveMember = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!user || !isAdmin) return;
+    const email = normalizeEmail(memberForm.email);
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      setError('請輸入有效的 Google 帳號電子郵件。');
+      return;
+    }
+    if (email === ADMIN_EMAIL) {
+      setError('主要管理員帳號的最高權限由系統保留。');
+      return;
+    }
+    if (email === normalizeEmail(user.email ?? '')) {
+      setError('不能在目前登入期間修改自己的權限。');
+      return;
+    }
+
+    setBusy(true);
+    setError('');
+    try {
+      const { db } = getFirebaseServices();
+      await setDoc(doc(db, 'members', email), {
+        email,
+        name: memberForm.name.trim(),
+        role: memberForm.role,
+        active: memberForm.active,
+        ...(editingMemberEmail ? {} : { createdAt: serverTimestamp() }),
+        updatedAt: serverTimestamp(),
+        updatedBy: user.email,
+      }, { merge: true });
+      await loadMembers();
+      resetMemberForm();
+      setNotice(`已儲存 ${email} 的「${roleLabel(memberForm.role)}」權限。`);
+    } catch (memberError) {
+      setError(firebaseError(memberError));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const removeMember = async (member: Membership) => {
+    const email = normalizeEmail(member.email);
+    if (!user || !isAdmin || email === ADMIN_EMAIL || email === normalizeEmail(user.email ?? '')) return;
+    if (!window.confirm(`確定移除 ${email} 的後台權限嗎？`)) return;
+    setBusy(true);
+    setError('');
+    try {
+      const { db } = getFirebaseServices();
+      await deleteDoc(doc(db, 'members', email));
+      await loadMembers();
+      if (editingMemberEmail === email) resetMemberForm();
+      setNotice(`已移除 ${email} 的後台權限。`);
+    } catch (memberError) {
+      setError(firebaseError(memberError));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   if (!authReady) {
     return <main className="flex min-h-screen items-center justify-center bg-[#eef4f9] text-[#42566c]"><p className="rounded-2xl bg-white px-6 py-4 shadow-sm">正在確認管理權限…</p></main>;
   }
@@ -245,10 +374,10 @@ export default function AdminPage() {
           <div className="mt-8 flex h-14 w-14 items-center justify-center rounded-2xl bg-[#0b6bcb] font-black text-white">DB</div>
           <p className="mt-6 text-xs font-black tracking-[0.16em] text-[#0b6bcb]">CONTENT ADMIN</p>
           <h1 className="mt-2 text-3xl font-black">題庫內容管理後台</h1>
-          <p className="mt-4 leading-7 text-[#5e7185]">使用指定的 Google 管理員帳號登入，即可新增、編輯、發布或刪除網站題目。</p>
+          <p className="mt-4 leading-7 text-[#5e7185]">使用已加入成員名單的 Google 帳號登入，系統會依照檢視者、編輯者或管理員角色開放功能。</p>
           {error && <p role="alert" className="mt-5 rounded-xl bg-[#fff0eb] px-4 py-3 text-sm font-bold text-[#9b3f22]">{error}</p>}
           <button type="button" onClick={signIn} disabled={busy} className="mt-7 w-full rounded-xl bg-[#0b6bcb] px-5 py-3.5 font-black text-white shadow-sm transition hover:bg-[#095aa9] disabled:opacity-50">{busy ? '登入中…' : '使用 Google 管理員帳號登入'}</button>
-          <p className="mt-4 text-center text-xs text-[#7b8ea1]">允許的管理帳號：{ADMIN_EMAIL}</p>
+          <p className="mt-4 text-center text-xs text-[#7b8ea1]">主要管理員：{ADMIN_EMAIL}</p>
         </section>
       </main>
     );
@@ -260,6 +389,7 @@ export default function AdminPage() {
         <div className="mx-auto flex max-w-[1500px] flex-wrap items-center gap-3 px-5 py-4 lg:px-8">
           <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-[#0b6bcb] text-xs font-black text-white">DB</div>
           <div><p className="text-[10px] font-black tracking-[0.14em] text-[#0b6bcb]">CONTENT ADMIN</p><h1 className="font-black">會考生物題庫管理</h1></div>
+          {membership && <span className="rounded-full bg-[#e8f2fc] px-3 py-1.5 text-xs font-black text-[#0b6bcb]">{roleLabel(membership.role)}</span>}
           <div className="ml-auto flex items-center gap-2"><a href="./" className="rounded-xl border border-[#cad7e4] px-3 py-2 text-xs font-black text-[#42566c]">查看網站 ↗</a><button type="button" onClick={() => signOut(getFirebaseServices().auth)} className="rounded-xl bg-[#edf2f7] px-3 py-2 text-xs font-black text-[#52677c]">登出</button></div>
         </div>
       </header>
@@ -267,27 +397,50 @@ export default function AdminPage() {
       <div className="mx-auto grid max-w-[1500px] gap-5 px-5 py-6 lg:grid-cols-[290px_minmax(0,1fr)] lg:px-8">
         <aside className="space-y-4">
           <section className="rounded-3xl bg-[#102f4f] p-5 text-white shadow-lg">
-            <p className="text-xs text-[#b8ccde]">已登入管理員</p><strong className="mt-1 block break-all text-sm">{user.email}</strong>
+            <p className="text-xs text-[#b8ccde]">已登入 · {membership ? roleLabel(membership.role) : ''}</p><strong className="mt-1 block break-all text-sm">{user.email}</strong>
             <div className="mt-5 grid grid-cols-2 gap-2"><div className="rounded-xl bg-white/10 p-3"><b className="block text-2xl">{records.length}</b><span className="text-xs text-[#cbd9e5]">資料庫題數</span></div><div className="rounded-xl bg-white/10 p-3"><b className="block text-2xl">{records.filter((item) => item.published).length}</b><span className="text-xs text-[#cbd9e5]">已發布</span></div></div>
           </section>
-          <button type="button" onClick={beginCreate} className="w-full rounded-xl bg-[#0b6bcb] px-4 py-3 text-sm font-black text-white shadow-sm">＋ 新增題目</button>
-          <button type="button" onClick={importSeedQuestions} disabled={busy} className="w-full rounded-xl border border-[#97bddd] bg-white px-4 py-3 text-sm font-black text-[#0b6bcb] disabled:opacity-50">匯入缺少的既有 45 題</button>
-          <p className="rounded-xl bg-[#e7f8f1] p-3 text-xs leading-5 text-[#23634f]">匯入功能只新增缺少的題目，不會覆寫您已修改的內容。</p>
+          <button type="button" onClick={() => setPanel('questions')} className={`w-full rounded-xl px-4 py-3 text-sm font-black ${panel === 'questions' ? 'bg-[#0b6bcb] text-white' : 'border border-[#cad7e4] bg-white text-[#42566c]'}`}>題目內容</button>
+          {isAdmin && <button type="button" onClick={() => { setPanel('members'); setNotice(''); setError(''); }} className={`w-full rounded-xl px-4 py-3 text-sm font-black ${panel === 'members' ? 'bg-[#0b6bcb] text-white' : 'border border-[#cad7e4] bg-white text-[#42566c]'}`}>成員與權限</button>}
+          {canEdit && panel === 'questions' && <><button type="button" onClick={beginCreate} className="w-full rounded-xl bg-[#0b6bcb] px-4 py-3 text-sm font-black text-white shadow-sm">＋ 新增題目</button><button type="button" onClick={importSeedQuestions} disabled={busy} className="w-full rounded-xl border border-[#97bddd] bg-white px-4 py-3 text-sm font-black text-[#0b6bcb] disabled:opacity-50">匯入缺少的既有 45 題</button></>}
+          <p className="rounded-xl bg-[#e7f8f1] p-3 text-xs leading-5 text-[#23634f]">{membership?.role === 'viewer' ? '目前為檢視權限：可閱讀全部題目與草稿，不能修改資料。' : membership?.role === 'editor' ? '目前為編輯權限：可新增、修改與發布題目，不能刪除或管理成員。' : '目前為管理員權限：可管理題庫、刪除資料及設定成員角色。'}</p>
         </aside>
 
         <section className="min-w-0">
-          <div className="rounded-3xl border border-white bg-white p-5 shadow-[0_14px_38px_rgba(26,64,101,.07)]">
+          {panel === 'questions' ? <div className="rounded-3xl border border-white bg-white p-5 shadow-[0_14px_38px_rgba(26,64,101,.07)]">
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center"><div><p className="text-xs font-black tracking-[0.14em] text-[#0b6bcb]">FIRESTORE</p><h2 className="text-xl font-black">題目內容</h2></div><label className="sm:ml-auto sm:w-80"><span className="sr-only">搜尋後台題目</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜尋年度、題號、章節或題幹…" className="w-full rounded-xl border border-[#cad7e4] px-4 py-2.5 text-sm outline-none focus:border-[#0b6bcb]" /></label></div>
             {notice && <p role="status" className="mt-4 rounded-xl bg-[#e7f8f1] px-4 py-3 text-sm font-bold text-[#23634f]">{notice}</p>}
             {error && <p role="alert" className="mt-4 rounded-xl bg-[#fff0eb] px-4 py-3 text-sm font-bold text-[#9b3f22]">{error}</p>}
             <div className="mt-5 overflow-x-auto">
               <table className="w-full min-w-[760px] border-separate border-spacing-y-2 text-left text-sm">
                 <thead className="text-xs text-[#71859a]"><tr><th className="px-3">題目</th><th className="px-3">章節／主題</th><th className="px-3">統計</th><th className="px-3">狀態</th><th className="px-3 text-right">操作</th></tr></thead>
-                <tbody>{filteredRecords.map((question) => <tr key={question.id} className="bg-[#f7fafc]"><td className="rounded-l-xl px-3 py-3 font-black">{question.year} 年<br /><span className="text-xs text-[#6e8296]">第 {question.number} 題 · {question.id}</span></td><td className="max-w-[330px] px-3 py-3"><span className="text-xs font-bold text-[#0b6bcb]">{question.chapter}</span><strong className="block truncate">{question.topic}</strong></td><td className="px-3 py-3 text-xs">答錯率<br /><b>{question.errorRate === null ? '待統計' : `${(question.errorRate * 100).toFixed(1)}%`}</b></td><td className="px-3 py-3"><span className={`rounded-full px-2.5 py-1 text-xs font-black ${question.published ? 'bg-[#e0f5ed] text-[#08765a]' : 'bg-[#e9edf1] text-[#607387]'}`}>{question.published ? '已發布' : '草稿'}</span></td><td className="rounded-r-xl px-3 py-3 text-right"><button type="button" onClick={() => beginEdit(question)} className="rounded-lg bg-white px-3 py-2 text-xs font-black text-[#0b6bcb] shadow-sm">編輯</button><button type="button" onClick={() => removeQuestion(question)} className="ml-2 rounded-lg px-3 py-2 text-xs font-black text-[#b44725]">刪除</button></td></tr>)}</tbody>
+                <tbody>{filteredRecords.map((question) => <tr key={question.id} className="bg-[#f7fafc]"><td className="rounded-l-xl px-3 py-3 font-black">{question.year} 年<br /><span className="text-xs text-[#6e8296]">第 {question.number} 題 · {question.id}</span></td><td className="max-w-[330px] px-3 py-3"><span className="text-xs font-bold text-[#0b6bcb]">{question.chapter}</span><strong className="block truncate">{question.topic}</strong></td><td className="px-3 py-3 text-xs">答錯率<br /><b>{question.errorRate === null ? '待統計' : `${(question.errorRate * 100).toFixed(1)}%`}</b></td><td className="px-3 py-3"><span className={`rounded-full px-2.5 py-1 text-xs font-black ${question.published ? 'bg-[#e0f5ed] text-[#08765a]' : 'bg-[#e9edf1] text-[#607387]'}`}>{question.published ? '已發布' : '草稿'}</span></td><td className="rounded-r-xl px-3 py-3 text-right">{canEdit ? <button type="button" onClick={() => beginEdit(question)} className="rounded-lg bg-white px-3 py-2 text-xs font-black text-[#0b6bcb] shadow-sm">編輯</button> : <span className="text-xs font-bold text-[#71859a]">僅供檢視</span>}{isAdmin && <button type="button" onClick={() => removeQuestion(question)} className="ml-2 rounded-lg px-3 py-2 text-xs font-black text-[#b44725]">刪除</button>}</td></tr>)}</tbody>
               </table>
               {!filteredRecords.length && <p className="py-12 text-center text-sm text-[#71859a]">目前沒有符合條件的題目。</p>}
             </div>
-          </div>
+          </div> : <div className="space-y-5">
+            <section className="rounded-3xl border border-white bg-white p-5 shadow-[0_14px_38px_rgba(26,64,101,.07)] sm:p-6">
+              <div><p className="text-xs font-black tracking-[0.14em] text-[#0b6bcb]">ACCESS CONTROL</p><h2 className="text-xl font-black">成員與權限</h2><p className="mt-2 text-sm leading-6 text-[#66788a]">以 Google 帳號電子郵件建立成員；使用者首次登入時即套用指定角色。</p></div>
+              {notice && <p role="status" className="mt-4 rounded-xl bg-[#e7f8f1] px-4 py-3 text-sm font-bold text-[#23634f]">{notice}</p>}
+              {error && <p role="alert" className="mt-4 rounded-xl bg-[#fff0eb] px-4 py-3 text-sm font-bold text-[#9b3f22]">{error}</p>}
+              <div className="mt-5 grid gap-3 md:grid-cols-3">{roleOptions.map((item) => <div key={item.value} className="rounded-2xl border border-[#dbe5ed] bg-[#f8fafc] p-4"><strong className="text-sm">{item.label}</strong><p className="mt-2 text-xs leading-5 text-[#66788a]">{item.description}</p></div>)}</div>
+            </section>
+
+            <form onSubmit={saveMember} className="rounded-3xl border border-white bg-white p-5 shadow-[0_14px_38px_rgba(26,64,101,.07)] sm:p-6">
+              <div className="flex items-center justify-between"><div><p className="text-xs font-black tracking-[0.14em] text-[#0b6bcb]">MEMBER</p><h3 className="text-lg font-black">{editingMemberEmail ? '修改成員權限' : '新增後台成員'}</h3></div>{editingMemberEmail && <button type="button" onClick={resetMemberForm} className="rounded-lg bg-[#edf2f7] px-3 py-2 text-xs font-black text-[#52677c]">取消修改</button>}</div>
+              <div className="mt-5 grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+                <label className="text-xs font-black text-[#52677c] xl:col-span-2">Google 帳號電子郵件<input type="email" disabled={Boolean(editingMemberEmail)} value={memberForm.email} onChange={(event) => setMemberForm({ ...memberForm, email: event.target.value })} placeholder="teacher@example.com" className="mt-2 w-full rounded-xl border border-[#cad7e4] px-3 py-2.5 text-sm disabled:bg-[#edf2f7]" /></label>
+                <label className="text-xs font-black text-[#52677c]">顯示名稱<input value={memberForm.name} onChange={(event) => setMemberForm({ ...memberForm, name: event.target.value })} placeholder="王老師" className="mt-2 w-full rounded-xl border border-[#cad7e4] px-3 py-2.5 text-sm" /></label>
+                <label className="text-xs font-black text-[#52677c]">權限角色<select value={memberForm.role} onChange={(event) => setMemberForm({ ...memberForm, role: event.target.value as Role })} className="mt-2 w-full rounded-xl border border-[#cad7e4] px-3 py-2.5 text-sm">{roleOptions.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}</select></label>
+              </div>
+              <div className="mt-4 flex flex-wrap items-center gap-3"><label className="flex items-center gap-2 rounded-xl bg-[#f5f8fb] px-4 py-3 text-sm font-black"><input type="checkbox" checked={memberForm.active} onChange={(event) => setMemberForm({ ...memberForm, active: event.target.checked })} />啟用此帳號</label><button type="submit" disabled={busy} className="rounded-xl bg-[#0b6bcb] px-5 py-3 text-sm font-black text-white disabled:opacity-50">{busy ? '儲存中…' : editingMemberEmail ? '更新權限' : '新增成員'}</button></div>
+            </form>
+
+            <section className="rounded-3xl border border-white bg-white p-5 shadow-[0_14px_38px_rgba(26,64,101,.07)] sm:p-6">
+              <div className="flex items-center justify-between"><div><p className="text-xs font-black tracking-[0.14em] text-[#0b6bcb]">MEMBER LIST</p><h3 className="text-lg font-black">已授權成員</h3></div><span className="rounded-full bg-[#edf5fc] px-3 py-1.5 text-xs font-black text-[#0b6bcb]">{members.length} 人</span></div>
+              <div className="mt-5 space-y-3">{members.map((member) => { const email = normalizeEmail(member.email); const locked = email === ADMIN_EMAIL || email === normalizeEmail(user.email ?? ''); return <article key={email} className="flex flex-col gap-3 rounded-2xl border border-[#dbe5ed] bg-[#f8fafc] p-4 sm:flex-row sm:items-center"><div className="min-w-0 flex-1"><div className="flex flex-wrap items-center gap-2"><strong>{member.name || email}</strong><span className={`rounded-full px-2.5 py-1 text-xs font-black ${member.role === 'admin' ? 'bg-[#e8f2fc] text-[#0b6bcb]' : member.role === 'editor' ? 'bg-[#e7f8f1] text-[#08765a]' : 'bg-[#edf0f3] text-[#607387]'}`}>{roleLabel(member.role)}</span><span className={`rounded-full px-2.5 py-1 text-xs font-black ${member.active ? 'bg-white text-[#08765a]' : 'bg-[#fff0eb] text-[#9b3f22]'}`}>{member.active ? '啟用' : '停用'}</span></div><p className="mt-1 break-all text-xs text-[#66788a]">{email}</p></div><div className="flex gap-2">{locked ? <span className="px-3 py-2 text-xs font-bold text-[#71859a]">{email === ADMIN_EMAIL ? '主要管理員' : '目前帳號'}</span> : <><button type="button" onClick={() => editMember(member)} className="rounded-lg bg-white px-3 py-2 text-xs font-black text-[#0b6bcb] shadow-sm">修改</button><button type="button" onClick={() => removeMember(member)} className="rounded-lg px-3 py-2 text-xs font-black text-[#b44725]">移除</button></>}</div></article>; })}</div>
+            </section>
+          </div>}
         </section>
       </div>
 
